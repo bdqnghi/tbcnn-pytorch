@@ -7,7 +7,7 @@ def train(epoch, dataloader, net, criterion, optimizer, opt):
     
     for i, (nodes, children, target) in enumerate(dataloader, 0):
     
-        net.zero_grad()
+        # net.zero_grad()
 
         # print(nodes)
         # print(nodes.shape)
@@ -27,6 +27,7 @@ def train(epoch, dataloader, net, criterion, optimizer, opt):
     
         loss = criterion(output, target)
 
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 

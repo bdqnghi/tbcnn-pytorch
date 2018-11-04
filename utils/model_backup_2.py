@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
 import numpy as np
-from torch.autograd import Variable
 
 from .function_util import tensordot
 torch.set_default_tensor_type('torch.cuda.DoubleTensor')
@@ -40,6 +39,7 @@ class ETA_T(nn.Module):
         batch_size = children.shape[0]
         max_tree_size = children.shape[1]
         max_children = children.shape[2]
+
 
         # eta_t is shape (batch_size x max_tree_size x max_children + 1)
         eta = torch.cat((torch.ones((max_tree_size, 1)),torch.zeros((max_tree_size, max_children))),1)
@@ -161,6 +161,28 @@ class CHILDREN_TENSOR(nn.Module):
 
         return result
 
+
+class CONV_NODE(nn.Module):
+    def __init__(self, opt):
+        super(CONV_NODE, self).__init__()
+        self.opt = opt
+        self.num_features = opt.num_features
+        self.output_size = opt.output_size
+        self.conv_step = CONV_STEP(self.opt)
+        self.w_t = torch.randn(self.num_features, self.output_size)
+        self.w_l = torch.randn(self.num_features, self.output_size)
+        self.w_r = torch.randn(self.num_features, self.output_size)
+        self.b_conv = torch.randn(self.output_size)
+     
+    def forward(self, nodes, children, feature_size):
+        """Perform convolutions over every batch sample."""
+        batch_size = children.shape[0]
+        max_tree_size = children.shape[1]
+        max_children = children.shape[2]
+        # w_t, w_r, w_l, b_conv = self.weights_bconv()
+        conv_result = self.conv_step(nodes, children, feature_size, self.w_t, self.w_r, self.w_l, self.b_conv)
+        return conv_result
+
 class CONV_LAYER(nn.Module):
     def __init__(self, opt):
         super(CONV_LAYER, self).__init__()
@@ -176,42 +198,79 @@ class CONV_LAYER(nn.Module):
         ]
         return torch.cat(nodes, 2)
 
-
-class CONV_NODE(nn.Module):
+class COEFFICIENTS(nn.Module):
     def __init__(self, opt):
-        super(CONV_NODE, self).__init__()
+        super(COEFFICIENTS, self).__init__()
+
+        self.opt = opt
+
+        self.eta_t =  ETA_T(self.opt)
+        self.eta_r =  ETA_R(self.opt)
+        self.eta_l =  ETA_L(self.opt)
+
+    def forward(self, children):
+
+        c_t = self.eta_t(children)
+        c_r = self.eta_r(children, c_t)
+        c_l = self.eta_l(children, c_t, c_r)
+        coef = torch.stack((c_t, c_r, c_l),3).double()
+
+        return coef
+
+class WEIGHTS(nn.Module):
+    def __init__(self, opt):
+        super(WEIGHTS, self).__init__()
+
+        self.opt = opt
+     
+
+    def forward(self, w_t, w_r, w_l, b_conv):
+        weights = torch.stack([w_t, w_r, w_l], 0).double()
+        return weights, b_conv
+
+class TREE_TENSOR_LAYER(nn.Module):
+    def __init__(self, opt):
+        super(TREE_TENSOR_LAYER, self).__init__()
+
         self.opt = opt
         self.num_features = opt.num_features
-        self.output_size = opt.output_size
-        self.conv_step = CONV_STEP(self.opt)
-        
-
-        self.w_t = torch.nn.Parameter(data=torch.Tensor(self.num_features,self.output_size), requires_grad=True)
-        self.w_t.data.uniform_(-1, 1)
-
-        self.w_r = torch.nn.Parameter(data=torch.Tensor(self.num_features,self.output_size), requires_grad=True)
-        self.w_r.data.uniform_(-1, 1)
-
-        self.w_l = torch.nn.Parameter(data=torch.Tensor(self.num_features,self.output_size), requires_grad=True)
-        self.w_l.data.uniform_(-1, 1)
-
-        self.b_conv = torch.nn.Parameter(data=torch.Tensor(self.output_size), requires_grad=True)
-        self.b_conv.data.uniform_(-1, 1)
-        # self.w_t = torch.randn(self.num_features, self.output_size, requires_grad=True)
-        # self.w_l = torch.randn(self.num_features, self.output_size, requires_grad=True)
-        # self.w_r = torch.randn(self.num_features, self.output_size, requires_grad=True)
-        # self.b_conv = Variable(torch.randn(self.output_size))
-     
+        self.children_tensor = CHILDREN_TENSOR(self.opt)
+  
     def forward(self, nodes, children, feature_size):
-        """Perform convolutions over every batch sample."""
+        # children is shape (batch_size x max_tree_size x max_children)
+        # children_tensor = CHILDREN_TENSOR(self.max_children, self.batch_size, self.max_tree_size, feature_size, self.opt)
+        children_vectors = self.children_tensor(nodes, children, feature_size)
+        # add a 4th dimension to the nodes tensor
+        nodes = nodes.unsqueeze(2)
+        # tree_tensor is shape (batch_size x max_tree_size x max_children + 1 x feature_size)
+        tree_tensor = torch.cat((nodes, children_vectors), 2)
+        return tree_tensor
+
+class COMBINE_LAYER(nn.Module):
+    def __init__(self, opt):
+        super(COMBINE_LAYER, self).__init__()
+        self.opt = opt
+
+
+    def forward(self, children, feature_size, tree_tensor, coef, weights, b_conv):
         batch_size = children.shape[0]
         max_tree_size = children.shape[1]
         max_children = children.shape[2]
+
+        x = batch_size * max_tree_size
+        y = max_children + 1
+
+        result = tree_tensor.view(x,y,feature_size)
+
+        coef = coef.view(x,y,3)
       
-        conv_result = self.conv_step(nodes, children, feature_size, self.w_t, self.w_r, self.w_l, self.b_conv)
+        result = torch.matmul(torch.transpose(result, 2, 1), coef)
+        result = result.view(batch_size, max_tree_size, 3, feature_size)
 
-        return conv_result
-
+        # # output is (batch_size, max_tree_size, output_size)
+        result = tensordot(result, weights, [[2, 3], [0, 1]])
+        # # output is (batch_size, max_tree_size, output_size)
+        return torch.tanh(result + b_conv)
 
 class CONV_STEP(nn.Module):
     def __init__(self, opt):
@@ -222,84 +281,11 @@ class CONV_STEP(nn.Module):
             self.cuda = True
     
         self.num_features = opt.num_features
-        self.children_tensor = CHILDREN_TENSOR(self.opt)
-        # self.coefficients = COEFFICIENTS(self.opt)
-        # self.eta_t =  ETA_T(self.opt)
-        # self.eta_r =  ETA_R(self.opt)
-        # self.eta_l =  ETA_L(self.opt)
-        # self.trees = TREE_TENSOR_LAYER(self.opt)
+        self.combine = COMBINE_LAYER(self.opt)
+        self.coefficients = COEFFICIENTS(self.opt)
+        self.compute_tree_tensor = TREE_TENSOR_LAYER(self.opt)
+        self.stack_weights = WEIGHTS(self.opt)
     
-    def eta_l(self, children, coef_t, coef_r):
-        """Compute weight matrix for how much each vector belongs to the 'left'"""
-        # creates a mask of 1's and 0's where 1 means there is a child there
-        # has shape (batch_size x max_tree_size x max_children + 1)
-        batch_size = children.shape[0]
-        max_tree_size = children.shape[1]
-        max_children = children.shape[2]
-
-        mask = torch.cat((
-            torch.zeros((batch_size, max_tree_size, 1)).double(),torch.min(children, torch.ones((batch_size, max_tree_size, max_children)).double()))
-        ,2)
-        
-        # eta_l is shape (batch_size x max_tree_size x max_children + 1)
-        result = torch.mul(torch.mul((1.0 - coef_t).double(),(1.0 - coef_r).double()).double(),mask)
-        return result
-
-    def eta_t(self, children):
-        """
-        Compute weight matrix for how much each vector belongs to the 'top'
-    
-        This part is tricky, this implementation only slide over a window of depth `, which means a child node in a window
-        always has depth = 1, according to the formula in the original paper, top-coefficient in this case is alwasy 0/1 = 1
-        """
-
-        batch_size = children.shape[0]
-        max_tree_size = children.shape[1]
-        max_children = children.shape[2]
-
-        # eta_t is shape (batch_size x max_tree_size x max_children + 1)
-        eta = torch.cat((torch.ones((max_tree_size, 1)),torch.zeros((max_tree_size, max_children))),1)
-        eta = eta.unsqueeze(0)
-        eta = tile(eta, 0, batch_size, self.cuda)
-        return eta
-
-    def eta_r(self, children, coef_t):
-        """Compute weight matrix for how much each vector belogs to the 'right'"""
-        # children is batch_size x max_tree_size x max_children
-        batch_size = children.shape[0]
-        max_tree_size = children.shape[1]
-        max_children = children.shape[2]
-
-        # num_siblings is shape (batch_size x max_tree_size x 1)
-        num_siblings = max_children - (children == 0).sum(dim=2,keepdim=True)
-      
-        # num_siblings is shape (batch_size x max_tree_size x max_children + 1)
-        num_siblings = tile(num_siblings, 2, max_children + 1, self.cuda).double()
-
-        # creates a mask of 1's and 0's where 1 means there is a child there
-        # has shape (batch_size x max_tree_size x max_children + 1)
-        mask = torch.cat((torch.zeros((batch_size, max_tree_size, 1)).double(),torch.min(children,torch.ones((batch_size, max_tree_size, max_children)).double())),2)
-        
-        # child indices for every tree (batch_size x max_tree_size x max_children + 1)
-        child_indices = torch.arange(-1.0, float(max_children) , 1.0).double()
-        child_indices = child_indices.unsqueeze(0)
-        child_indices = child_indices.unsqueeze(0)
-        child_indices = tile(child_indices, 0 , batch_size, self.cuda)
-        child_indices = tile(child_indices, 1, max_tree_size, self.cuda)
-        child_indices = torch.mul(child_indices,mask)
-
-        # weights for every tree node in the case that num_siblings = 0
-        # shape is (batch_size x max_tree_size x max_children + 1)
-        singles = torch.cat((torch.zeros((batch_size, max_tree_size,1)).double(), torch.tensor((),dtype=torch.double).new_full((batch_size, max_tree_size, 1),0.5), torch.zeros((batch_size, max_tree_size, max_children - 1)).double()),2)
-
-        # eta_r is shape (batch_size x max_tree_size x max_children + 1)
-        result = torch.where(
-            torch.eq(num_siblings,torch.ones((batch_size, max_tree_size, max_children + 1)).double()),
-            singles,
-            torch.mul((1.0 - coef_t).double(),torch.div(child_indices,num_siblings-1.0).double())
-        )
-        return result
-
     def forward(self, nodes, children, feature_size, w_t, w_r, w_l, b_conv):
         """Convolve a batch of nodes and children.
 
@@ -314,39 +300,13 @@ class CONV_STEP(nn.Module):
         max_tree_size = children.shape[1]
         max_children = children.shape[2]
 
-        # children is shape (batch_size x max_tree_size x max_children)
-        # children_tensor = CHILDREN_TENSOR(self.max_children, self.batch_size, self.max_tree_size, feature_size, self.opt)
-        children_vectors = self.children_tensor(nodes, children, feature_size)
-        # add a 4th dimension to the nodes tensor
-        nodes = nodes.unsqueeze(2)
-        # tree_tensor is shape (batch_size x max_tree_size x max_children + 1 x feature_size)
+        tree_tensor = self.compute_tree_tensor(nodes, children, feature_size)
+        coef = self.coefficients(children)
+        # weights = torch.stack([w_t, w_r, w_l], 0).double()
+        weights, b_conv = self.stack_weights(w_t, w_r, w_l, b_conv)
 
-        tree_tensor = torch.cat((nodes, children_vectors), 2)
-
-        c_t = self.eta_t(children)
-        c_r = self.eta_r(children, c_t)
-        c_l = self.eta_l(children, c_t, c_r)
-        # coef = self.coefficients(children)
-        coef = torch.stack((c_t, c_r, c_l),3).double()
-
-        weights = torch.stack([w_t, w_r, w_l], 0).double()
-
-        # reshape for matrix multiplication
-        x = batch_size * max_tree_size
-        y = max_children + 1
-
-        result = tree_tensor.view(x,y,feature_size)
-
-        coef = coef.view(x,y,3)
-      
-        result = torch.matmul(torch.transpose(result, 1, 2), coef)
-        result = result.view(batch_size, max_tree_size, 3, feature_size)
-
-        # # output is (batch_size, max_tree_size, output_size)
-        result = tensordot(result, weights, [[2, 3], [0, 1]])
-        # # output is (batch_size, max_tree_size, output_size)
-    
-        return torch.tanh(result + b_conv)
+        return self.combine(children, feature_size, tree_tensor, coef, weights, b_conv)
+        
 
 class TBCNN(nn.Module):
     """
