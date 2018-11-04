@@ -223,12 +223,7 @@ class CONV_STEP(nn.Module):
     
         self.num_features = opt.num_features
         self.children_tensor = CHILDREN_TENSOR(self.opt)
-        # self.coefficients = COEFFICIENTS(self.opt)
-        # self.eta_t =  ETA_T(self.opt)
-        # self.eta_r =  ETA_R(self.opt)
-        # self.eta_l =  ETA_L(self.opt)
-        # self.trees = TREE_TENSOR_LAYER(self.opt)
-    
+
     def eta_l(self, children, coef_t, coef_r):
         """Compute weight matrix for how much each vector belongs to the 'left'"""
         # creates a mask of 1's and 0's where 1 means there is a child there
@@ -294,7 +289,7 @@ class CONV_STEP(nn.Module):
 
         # eta_r is shape (batch_size x max_tree_size x max_children + 1)
         result = torch.where(
-            torch.eq(num_siblings,torch.ones((batch_size, max_tree_size, max_children + 1)).double()),
+            torch.eq(num_siblings,1.0),
             singles,
             torch.mul((1.0 - coef_t).double(),torch.div(child_indices,num_siblings-1.0).double())
         )

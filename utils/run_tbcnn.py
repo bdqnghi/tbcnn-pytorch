@@ -24,7 +24,7 @@ def train(epoch, dataloader, net, criterion, optimizer, opt):
 
         if opt.cuda:
             output = output.cuda()
-    
+        
         loss = criterion(output, target)
 
         optimizer.zero_grad()
